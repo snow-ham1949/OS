@@ -24,7 +24,7 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 // there should be one superblock per disk device, but we run with
 // only one device
-struct superblock sb; 
+struct superblock sb;
 
 // Read the super block.
 static void
@@ -180,7 +180,7 @@ void
 iinit()
 {
   int i = 0;
-  
+
   initlock(&itable.lock, "itable");
   for(i = 0; i < NINODE; i++) {
     initsleeplock(&itable.inode[i].lock, "inode");
@@ -377,9 +377,6 @@ iunlockput(struct inode *ip)
 static uint
 bmap(struct inode *ip, uint bn)
 {
-  // TODO: Large Files
-  // You should modify bmap(),
-  // so that it can handle doubly indrect inode.
   uint addr, *a;
   struct buf *bp;
 
@@ -390,7 +387,7 @@ bmap(struct inode *ip, uint bn)
   }
   bn -= NDIRECT;
 
-  if(bn < NINDIRECT){
+  if(bn < NINDIRECT){ // singly-indirect
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0)
       ip->addrs[NDIRECT] = addr = balloc(ip->dev);
@@ -403,6 +400,52 @@ bmap(struct inode *ip, uint bn)
     brelse(bp);
     return addr;
   }
+  bn -= NINDIRECT;
+
+  if(bn < NDOUBLYINDIRECT) { // doubly-indirect
+    // Load indirect block, allocating if necessary.
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn/NINDIRECT]) == 0){
+      a[bn/NINDIRECT] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+    bn %= NINDIRECT;
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn]) == 0){
+      a[bn] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+    return addr;
+  }
+  bn -= NDOUBLYINDIRECT;
+  if(bn < NDOUBLYINDIRECT) { // doubly-indirect
+    // Load indirect block, allocating if necessary.
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn/NINDIRECT]) == 0){
+      a[bn/NINDIRECT] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+    bn %= NINDIRECT;
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn]) == 0){
+      a[bn] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+    return addr;
+  }
+
 
   panic("bmap: out of range");
 }
@@ -412,9 +455,6 @@ bmap(struct inode *ip, uint bn)
 void
 itrunc(struct inode *ip)
 {
-  // TODO: Large Files
-  // You should modify itruc(),
-  // so that it can handle doubly indrect inode.
   int i, j;
   struct buf *bp;
   uint *a;
@@ -436,6 +476,46 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  if(ip->addrs[NDIRECT+1]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+    a = (uint*)bp->data;
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j]) {
+        struct buf *bp2 = bread(ip->dev, a[j]);
+        uint *a2 = (uint*)bp2->data;
+        for(int k = 0; k < NINDIRECT; k++){
+          if(a2[k])
+            bfree(ip->dev, a2[k]);
+        }
+        brelse(bp2);
+        bfree(ip->dev, a[j]);
+      }
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);
+    ip->addrs[NDIRECT+1] = 0;
+  }
+
+  if(ip->addrs[NDIRECT+2]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT+2]);
+    a = (uint*)bp->data;
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j]) {
+        struct buf *bp2 = bread(ip->dev, a[j]);
+        uint *a2 = (uint*)bp2->data;
+        for(int k = 0; k < NINDIRECT; k++){
+          if(a2[k])
+            bfree(ip->dev, a2[k]);
+        }
+        brelse(bp2);
+        bfree(ip->dev, a[j]);
+      }
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT+2]);
+    ip->addrs[NDIRECT+2] = 0;
   }
 
   ip->size = 0;
@@ -631,13 +711,14 @@ skipelem(char *path, char *name)
 // If parent != 0, return the inode for the parent and copy the final
 // path element into name, which must have room for DIRSIZ bytes.
 // Must be called inside a transaction since it calls iput().
+// depth is for following symlink recursively.
 static struct inode*
-namex(char *path, int nameiparent, char *name)
+namex(char *path, int nameiparent, char *name, int depth)
 {
   // TODO: Symbolic Link to Directories
   // Modify this function to deal with symbolic links to directories.
   struct inode *ip, *next;
-  
+
   if(*path == '/')
     ip = iget(ROOTDEV, ROOTINO);
   else
@@ -645,6 +726,28 @@ namex(char *path, int nameiparent, char *name)
 
   while((path = skipelem(path, name)) != 0){
     ilock(ip);
+    if (ip->type == T_SYMLINK) {
+      if (depth >= 10) {
+        iunlockput(ip);
+        return 0;
+      }
+      // open symlink directory recursively
+      // read the target path
+      char target[MAXPATH];
+      if (readi(ip, 0, (uint64)target, 0, MAXPATH) < 0) {
+        iunlockput(ip);
+        return 0;
+      }
+      iunlockput(ip);
+
+      // open the target inode
+      char name[DIRSIZ];
+      if ((ip = namex(target, 0, name, depth + 1)) == 0) {
+        return 0;
+      }
+      ilock(ip);
+    }
+
     if(ip->type != T_DIR){
       iunlockput(ip);
       return 0;
@@ -672,11 +775,11 @@ struct inode*
 namei(char *path)
 {
   char name[DIRSIZ];
-  return namex(path, 0, name);
+  return namex(path, 0, name, 0);
 }
 
 struct inode*
 nameiparent(char *path, char *name)
 {
-  return namex(path, 1, name);
+  return namex(path, 1, name, 0);
 }

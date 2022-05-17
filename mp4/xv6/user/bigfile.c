@@ -48,7 +48,7 @@ public2()
 {
   char buf[BSIZE];
   int fd, blocks;
-  int target = 6666;
+  int target = 66666;
 
   fd = open("big.file", O_CREATE | O_WRONLY);
   if(fd < 0){
