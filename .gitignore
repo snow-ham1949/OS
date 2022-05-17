@@ -1,3 +1,8 @@
 .DS_Store
 *.pdf
 *.zip
+*.img
+*.d 
+*.o
+*.asm
+*.sym
