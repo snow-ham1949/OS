@@ -7,3 +7,5 @@
 *.asm
 *.sym
 
+*.csv
+*.out
