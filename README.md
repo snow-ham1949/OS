@@ -1,5 +1,7 @@
 # NTU OS 2022 SPRING
 
+prof Chi-Sheng Shih and Chung-Wei Lin
+
 my score:
 | hw | score|
 | --- | --- |
